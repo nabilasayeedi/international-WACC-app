@@ -160,9 +160,56 @@ def _now() -> str:
 
 
 def _get(url: str) -> requests.Response:
-    resp = requests.get(url, headers=HEADERS, timeout=40)
-    resp.raise_for_status()
-    return resp
+    """GET with browser-like headers (some sites return 403 to bare scripts)."""
+    host = re.match(r"https?://([^/]+)/", url)
+    headers = {
+        **HEADERS,
+        "Referer": f"https://{host.group(1)}/" if host else "https://www.google.com/",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Cache-Control": "no-cache",
+    }
+    last_exc: Exception | None = None
+    with requests.Session() as sess:
+        for _ in range(2):
+            try:
+                resp = sess.get(url, headers=headers, timeout=40)
+                resp.raise_for_status()
+                return resp
+            except requests.RequestException as exc:
+                last_exc = exc
+    raise last_exc  # type: ignore[misc]
+
+
+def _read_tables(html: str) -> list[pd.DataFrame]:
+    """pandas.read_html with lxml first, then the bs4/html5lib parser."""
+    errors = []
+    for flavor in ("lxml", "bs4"):
+        try:
+            tables = pd.read_html(io.StringIO(html), flavor=flavor)
+            if tables:
+                return tables
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{flavor}: {exc}")
+    raise ValueError("No HTML tables could be parsed (" + "; ".join(errors) + ")")
+
+
+# Approximate OECD statutory CIT rates (combined central + sub-central), 2024 edition.
+# Used ONLY if the OECD page blocks automated access. Verify against the OECD table.
+OECD_FALLBACK = {
+    "United States": 25.8, "Canada": 26.2, "Mexico": 30.0, "Brazil": 34.0,
+    "Argentina": 35.0, "Chile": 27.0, "Colombia": 35.0, "United Kingdom": 25.0,
+    "Germany": 29.9, "France": 25.8, "Italy": 27.8, "Spain": 25.0,
+    "Netherlands": 25.8, "Belgium": 25.0, "Austria": 23.0, "Ireland": 12.5,
+    "Switzerland": 14.7, "Sweden": 20.6, "Norway": 22.0, "Denmark": 22.0,
+    "Finland": 20.0, "Poland": 19.0, "Czech Republic": 21.0, "Hungary": 9.0,
+    "Turkey": 25.0, "Israel": 23.0, "Japan": 29.7, "South Korea": 26.4,
+    "Australia": 30.0, "New Zealand": 28.0, "China": 25.0, "India": 25.2,
+    "Indonesia": 22.0, "Singapore": 17.0, "Hong Kong": 16.5,
+    "South Africa": 27.0, "Saudi Arabia": 20.0,
+}
 
 
 def _num(x) -> float:
@@ -269,7 +316,7 @@ def fetch_damodaran_bbb() -> dict:
     out = _result(BBB_URL, "Damodaran (NYU Stern) - Baa2/BBB spread, large non-financial service firms")
     try:
         r = _get(BBB_URL)
-        tables = pd.read_html(io.StringIO(r.text))
+        tables = _read_tables(r.text)
         spread = None
         for t in tables:
             t = t.copy()
@@ -305,7 +352,7 @@ def fetch_oecd_tax() -> dict:
     out = _result(OECD_URL, "OECD Corporate Tax Statistics 2024 - statutory corporate income tax rates")
     try:
         r = _get(OECD_URL)
-        tables = pd.read_html(io.StringIO(r.text))
+        tables = _read_tables(r.text)
         rates: dict[str, float] = {}
         years_used: list[int] = []
         for t in tables:
@@ -343,6 +390,8 @@ def fetch_oecd_tax() -> dict:
         )
     except Exception as exc:  # noqa: BLE001
         out["error"] = f"{type(exc).__name__}: {exc}"
+        out["data"] = {k: v / 100 for k, v in OECD_FALLBACK.items()}
+        out["as_of"] = "BUILT-IN FALLBACK (approx. OECD 2024 rates; OECD site blocked automated access)"
     return out
 
 
@@ -351,7 +400,7 @@ def fetch_te_yields() -> dict:
     out = _result(TE_URL, "Trading Economics - government bond yields (10-year)")
     try:
         r = _get(TE_URL)
-        tables = pd.read_html(io.StringIO(r.text))
+        tables = _read_tables(r.text)
         yields: dict[str, tuple[float, str]] = {}
         for t in tables:
             t = t.copy()
@@ -444,6 +493,7 @@ def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
 def override_input(
     label: str, fetched: float | None, key: str, *, min_value: float,
     max_value: float, step: float, fallback_default: float, unit: str = "%",
+    fetched_label: str = "Fetched",
 ) -> tuple[float, str]:
     """Show a fetched value, or a manual box when overridden / data is missing.
 
@@ -464,8 +514,8 @@ def override_input(
             step=float(step), format="%.2f", key=f"num_{key}",
         )
         return float(val), "Manual"
-    st.caption(f"Using fetched: {fetched:.2f}{unit if unit else ''}")
-    return float(fetched), "Fetched"
+    st.caption(f"Using {fetched_label.lower()}: {fetched:.2f}{unit if unit else ''}")
+    return float(fetched), fetched_label
 
 
 # ----------------------------------------------------------------------------
@@ -480,6 +530,8 @@ with st.spinner("Fetching the latest data..."):
 beta_df: pd.DataFrame | None = beta_res["data"]
 tax_map: dict[str, float] = tax_res["data"] or {}
 yield_map: dict[str, tuple[float, str]] = yld_res["data"] or {}
+
+tax_label_src = "Fetched" if tax_res["ok"] else "Fallback (approx.)"
 
 industries = list(beta_df["Industry"]) if beta_df is not None else [DEFAULT_INDUSTRY]
 
@@ -543,6 +595,7 @@ with st.sidebar:
         "U.S. corporate tax rate",
         us_tax_fetched * 100 if us_tax_fetched is not None else None,
         "tax_us", min_value=0.0, max_value=60.0, step=0.1, fallback_default=25.0,
+        fetched_label=tax_label_src,
     )
     st.divider()
     if is_us:
@@ -554,6 +607,7 @@ with st.sidebar:
             f"{country} corporate tax rate",
             fc_tax_fetched * 100 if fc_tax_fetched is not None else None,
             f"tax_{country}", min_value=0.0, max_value=60.0, step=0.1, fallback_default=25.0,
+            fetched_label=tax_label_src,
         )
     st.divider()
     bbb_fetched = bbb_res["data"]
