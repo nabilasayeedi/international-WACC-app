@@ -196,6 +196,69 @@ def _read_tables(html: str) -> list[pd.DataFrame]:
     raise ValueError("No HTML tables could be parsed (" + "; ".join(errors) + ")")
 
 
+def _clean_md_cell(c: str) -> str:
+    c = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", c)          # images
+    c = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", c)       # links -> text
+    return re.sub(r"[*_`]", "", c).strip()
+
+
+def _md_tables(md: str) -> list[pd.DataFrame]:
+    """Parse markdown pipe-tables (as returned by a reader service) into DataFrames."""
+    tables, block = [], []
+
+    def flush():
+        if len(block) >= 3:
+            rows = [[_clean_md_cell(c) for c in ln.strip().strip("|").split("|")] for ln in block]
+            rows = [r for r in rows if not all(re.fullmatch(r":?-{2,}:?", c) or c == "" for c in r)
+                    or any(c for c in r if not re.fullmatch(r":?-{2,}:?", c))]
+            rows = [r for r in rows if not all(re.fullmatch(r":?-{2,}:?", c) for c in r if c)]
+            if len(rows) >= 2:
+                width = len(rows[0])
+                names, seen = [], {}
+                for i, h in enumerate(rows[0]):
+                    h = h or f"col{i}"
+                    seen[h] = seen.get(h, 0) + 1
+                    names.append(h if seen[h] == 1 else f"{h}_{seen[h]}")
+                body = [(r + [""] * width)[:width] for r in rows[1:]]
+                tables.append(pd.DataFrame(body, columns=names))
+        block.clear()
+
+    for line in md.splitlines():
+        if line.strip().startswith("|"):
+            block.append(line)
+        else:
+            flush()
+    flush()
+    return tables
+
+
+def _get_tables(url: str) -> tuple[list[pd.DataFrame], str]:
+    """Tables from a page: direct request first; if the site blocks the server
+    (HTTP 403 / JavaScript-rendered tables), retry through the r.jina.ai reader."""
+    clean_url = url.split("#")[0]
+    try:
+        r = _get(clean_url)
+        return _read_tables(r.text), "direct"
+    except Exception as exc1:  # noqa: BLE001
+        try:
+            rr = requests.get(
+                "https://r.jina.ai/" + clean_url,
+                headers={
+                    "User-Agent": HEADERS["User-Agent"],
+                    "X-Timeout": "40",
+                    "X-Wait-For-Selector": "table",
+                },
+                timeout=100,
+            )
+            rr.raise_for_status()
+            tables = _md_tables(rr.text)
+            if not tables:
+                raise ValueError("reader returned no tables")
+            return tables, "r.jina.ai reader"
+        except Exception as exc2:  # noqa: BLE001
+            raise RuntimeError(f"direct request failed ({exc1}); reader fallback failed ({exc2})") from exc2
+
+
 # Approximate OECD statutory CIT rates (combined central + sub-central), 2024 edition.
 # Used ONLY if the OECD page blocks automated access. Verify against the OECD table.
 OECD_FALLBACK = {
@@ -351,8 +414,7 @@ def fetch_damodaran_bbb() -> dict:
 def fetch_oecd_tax() -> dict:
     out = _result(OECD_URL, "OECD Corporate Tax Statistics 2024 - statutory corporate income tax rates")
     try:
-        r = _get(OECD_URL)
-        tables = _read_tables(r.text)
+        tables, via = _get_tables(OECD_URL)
         rates: dict[str, float] = {}
         years_used: list[int] = []
         for t in tables:
@@ -386,7 +448,7 @@ def fetch_oecd_tax() -> dict:
             raise ValueError("Could not find a statutory-rate table containing the United States.")
         out.update(
             ok=True, data=rates,
-            as_of=f"Corporate Tax Statistics 2024 - rates for {max(years_used)}",
+            as_of=f"Corporate Tax Statistics 2024 - rates for {max(years_used)} (fetched {via})",
         )
     except Exception as exc:  # noqa: BLE001
         out["error"] = f"{type(exc).__name__}: {exc}"
@@ -399,8 +461,7 @@ def fetch_oecd_tax() -> dict:
 def fetch_te_yields() -> dict:
     out = _result(TE_URL, "Trading Economics - government bond yields (10-year)")
     try:
-        r = _get(TE_URL)
-        tables = _read_tables(r.text)
+        tables, via = _get_tables(TE_URL)
         yields: dict[str, tuple[float, str]] = {}
         for t in tables:
             t = t.copy()
@@ -430,7 +491,7 @@ def fetch_te_yields() -> dict:
                 )
         if "United States" not in yields:
             raise ValueError("Could not find the United States yield on the page.")
-        out.update(ok=True, data=yields, as_of=f"quote date: {yields['United States'][1]}")
+        out.update(ok=True, data=yields, as_of=f"quote date: {yields['United States'][1]} (fetched {via})")
     except Exception as exc:  # noqa: BLE001
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
