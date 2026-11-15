@@ -253,7 +253,7 @@ def _get_tables(url: str) -> tuple[list[pd.DataFrame], str]:
             rr.raise_for_status()
             tables = _md_tables(rr.text)
             if not tables:
-                raise ValueError("reader returned no tables")
+                raise ValueError(f"reader returned no tables; response began: {rr.text[:160]!r}")
             return tables, "r.jina.ai reader"
         except Exception as exc2:  # noqa: BLE001
             raise RuntimeError(f"direct request failed ({exc1}); reader fallback failed ({exc2})") from exc2
@@ -497,6 +497,59 @@ def fetch_te_yields() -> dict:
     return out
 
 
+ISO2 = {
+    "United States": "US", "Canada": "CA", "Mexico": "MX", "Brazil": "BR", "Argentina": "AR",
+    "Chile": "CL", "Colombia": "CO", "Peru": "PE", "Costa Rica": "CR", "United Kingdom": "GB",
+    "Switzerland": "CH", "Sweden": "SE", "Norway": "NO", "Denmark": "DK", "Poland": "PL",
+    "Czech Republic": "CZ", "Hungary": "HU", "Romania": "RO", "Iceland": "IS", "Turkey": "TR",
+    "Israel": "IL", "Saudi Arabia": "SA", "Japan": "JP", "China": "CN", "Hong Kong": "HK",
+    "South Korea": "KR", "Taiwan": "TW", "India": "IN", "Indonesia": "ID", "Malaysia": "MY",
+    "Thailand": "TH", "Philippines": "PH", "Vietnam": "VN", "Singapore": "SG", "Pakistan": "PK",
+    "Australia": "AU", "New Zealand": "NZ", "South Africa": "ZA", "Egypt": "EG", "Nigeria": "NG",
+    "Kenya": "KE", "Morocco": "MA", "Germany": "DE", "France": "FR", "Italy": "IT", "Spain": "ES",
+    "Netherlands": "NL", "Belgium": "BE", "Austria": "AT", "Finland": "FI", "Ireland": "IE",
+    "Portugal": "PT", "Greece": "GR", "Slovakia": "SK", "Slovenia": "SI", "Lithuania": "LT",
+    "Latvia": "LV", "Estonia": "EE", "Luxembourg": "LU", "Croatia": "HR", "Cyprus": "CY",
+    "Malta": "MT", "Bulgaria": "BG",
+}
+
+
+def _fred_last(series_id: str) -> tuple[float, str]:
+    """Latest non-missing observation of a FRED series (public CSV, no API key)."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    df = pd.read_csv(io.StringIO(_get(url).text))
+    df = df.iloc[:, :2]
+    df.columns = ["date", "value"]
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna()
+    if df.empty:
+        raise ValueError(f"FRED series {series_id} has no observations")
+    return float(df["value"].iloc[-1]) / 100, str(df["date"].iloc[-1])
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_fred_yield(country: str) -> tuple[float, str] | None:
+    """Fallback 10-year yield from FRED: DGS10 (U.S., daily) or the OECD monthly
+    long-term interest-rate series IRLTLT01xxM156N (other countries)."""
+    try:
+        if country == "United States":
+            v, d = _fred_last("DGS10")
+            return v, f"{d} (FRED DGS10)"
+        code = ISO2.get(country)
+        if not code:
+            return None
+        sid = f"IRLTLT01{code}M156N"
+        v, d = _fred_last(sid)
+        return v, f"{d} (FRED/OECD {sid}, monthly)"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_yield(country: str) -> tuple[float, str] | None:
+    return yield_map.get(country) or fetch_fred_yield(country)
+
+
+
 # ----------------------------------------------------------------------------
 # Finance calculations
 # ----------------------------------------------------------------------------
@@ -588,6 +641,16 @@ with st.spinner("Fetching the latest data..."):
     tax_res = fetch_oecd_tax()
     yld_res = fetch_te_yields()
 
+if not yld_res["ok"]:
+    _us = fetch_fred_yield("United States")
+    if _us:
+        yld_res = {
+            **yld_res, "ok": True, "data": {"United States": _us},
+            "source": "FRED (St. Louis Fed) - 10-year yields [fallback: Trading Economics was unreachable]",
+            "as_of": f"U.S.: {_us[1]}; other countries: latest OECD monthly 10-year yield on FRED",
+            "url": "https://fred.stlouisfed.org/series/DGS10",
+        }
+
 beta_df: pd.DataFrame | None = beta_res["data"]
 tax_map: dict[str, float] = tax_res["data"] or {}
 yield_map: dict[str, tuple[float, str]] = yld_res["data"] or {}
@@ -678,23 +741,25 @@ with st.sidebar:
         "bbb_usd", min_value=0.0, max_value=20.0, step=0.01, fallback_default=1.0,
     )
     st.divider()
-    us_y = yield_map.get("United States")
+    us_y = get_yield("United States")
     rf_us_pct, rf_us_origin = override_input(
         "U.S. 10-year government yield",
         us_y[0] * 100 if us_y else None,
         "y_us", min_value=-2.0, max_value=50.0, step=0.01, fallback_default=4.0,
+        fetched_label="FRED fallback" if us_y and "FRED" in us_y[1] else "Fetched",
     )
     st.divider()
     if is_us:
         rf_fc_pct, rf_fc_origin = rf_us_pct, "Same as U.S."
         st.caption("Selected country is the U.S.: foreign yield = U.S. yield.")
     else:
-        fc_y = yield_map.get(country)
+        fc_y = get_yield(country)
         rf_fc_pct, rf_fc_origin = override_input(
             f"{country} 10-year government yield",
             fc_y[0] * 100 if fc_y else None,
             f"y_{country}", min_value=-2.0, max_value=100.0, step=0.01,
             fallback_default=rf_us_pct,
+            fetched_label="FRED fallback" if fc_y and "FRED" in fc_y[1] else "Fetched",
         )
 
     # Auto foreign BBB spread (depends on the inputs resolved above)
@@ -786,7 +851,8 @@ num_df = pd.DataFrame(numeric_rows)
 
 # Inputs & sources table
 def _yield_date(c: str) -> str:
-    return yield_map[c][1] if c in yield_map else "n/a"
+    y = get_yield(c)
+    return y[1] if y else "n/a"
 
 src_rows = [
     ("Unlevered beta - " + industry, f"{beta_u:.3f}", beta_origin, beta_res["source"], beta_res["as_of"], beta_res["retrieved"], BETA_URL),
