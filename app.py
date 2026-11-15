@@ -1,4 +1,4 @@
-International Cost of Capital App (Streamlit).
+"""International Cost of Capital App (Streamlit).
 
 Compares a project's cost of equity, cost of debt and WACC in USD and in the
 currency of a selected country.
