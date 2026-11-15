@@ -86,5 +86,4 @@ textColor = "#f5f0ff"
 ## Troubleshooting
 
 - `xlrd` is required to read the old-format `betas.xls`; `lxml` is required for `pandas.read_html`. Both are in `requirements.txt`.
-- HTTP 403 / timeouts on a source: wait and press **Refresh data**, or use the manual overrides.
-# international-WACC-app
+- HTTP 403 on OECD / Trading Economics is common when the app runs on a cloud host (these sites block data-center IPs, and Trading Economics also loads its tables with JavaScript). The app first tries a direct request, then retries through the free [r.jina.ai](https://r.jina.ai) reader, which renders the page and returns the tables as text. If both fail, press **Refresh data** later or use the manual overrides (and the built-in approximate OECD tax fallback).
